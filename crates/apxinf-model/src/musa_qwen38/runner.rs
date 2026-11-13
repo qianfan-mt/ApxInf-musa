@@ -13,7 +13,44 @@ use apxinf_musa::{kernels::qwen38, ops, transfers, MusaBuffer, MusaContext};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
+    time::Instant,
 };
+
+/// Intrusive synchronized wall timings, in milliseconds; not kernel event timings.
+#[derive(Debug, Default)]
+pub struct ForwardProfile {
+    pub gdn_ms: f64,
+    pub attention_ms: f64,
+    pub mlp_ms: f64,
+    pub final_norm_ms: f64,
+    pub head_ms: f64,
+    pub total_ms: f64,
+}
+fn validate_tuning(position: usize, poisoned: bool) -> Result<()> {
+    if poisoned || position != 0 {
+        return Err(error(
+            "tuning requires a healthy request at position zero; reset first",
+        ));
+    }
+    Ok(())
+}
+fn timed<T>(
+    ctx: &MusaContext,
+    elapsed: Option<&mut f64>,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match elapsed {
+        None => f(),
+        Some(elapsed) => {
+            ctx.synchronize()?;
+            let start = Instant::now();
+            let result = f()?;
+            ctx.synchronize()?;
+            *elapsed += start.elapsed().as_secs_f64() * 1000.0;
+            Ok(result)
+        }
+    }
+}
 
 const EMBED: &str = "model.language_model.embed_tokens.weight";
 const NORM: &str = "model.language_model.norm.weight";
@@ -325,9 +362,43 @@ impl EagerRunner {
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
+    /// Replace the existing GEMM tuning session only between healthy requests.
+    pub fn configure_tuning(
+        &mut self,
+        mode: apxinf_musa::tuning::TuningMode,
+        databases: &[apxinf_musa::tuning::TuningDb],
+        paths: Option<apxinf_musa::tuning::TuningPaths>,
+    ) -> Result<()> {
+        validate_tuning(self.position(), self.poisoned)?;
+        self.poisoned = true;
+        apxinf_musa::kernels::gemm::configure_tuning(&self.ctx, mode, databases, paths)?;
+        self.poisoned = false;
+        Ok(())
+    }
+    /// Diagnostic traversal with synchronization around every measured category.
+    /// Normal forward keeps only its existing per-token synchronization.
+    pub fn forward_profiled(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(Tensor, ForwardProfile)> {
+        let mut profile = ForwardProfile::default();
+        let start = Instant::now();
+        let output = self.forward_impl(tokens, start_pos, Some(&mut profile))?;
+        profile.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        Ok((output, profile))
+    }
     /// Traverse tokens sequentially and return all logits, `[tokens.len(), 248320]`.
     /// All caller errors are checked before allocation, cache or ledger mutation.
     pub fn forward(&mut self, tokens: &[u32], start_pos: usize) -> Result<Tensor> {
+        self.forward_impl(tokens, start_pos, None)
+    }
+    fn forward_impl(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        profile: Option<&mut ForwardProfile>,
+    ) -> Result<Tensor> {
         validate_forward(
             tokens,
             start_pos,
@@ -336,13 +407,18 @@ impl EagerRunner {
             self.poisoned,
         )?;
         self.poisoned = true;
-        let result = self.forward_inner(tokens, start_pos);
+        let result = self.forward_inner(tokens, start_pos, profile);
         if result.is_ok() {
             self.poisoned = false;
         }
         result
     }
-    fn forward_inner(&mut self, tokens: &[u32], start: usize) -> Result<Tensor> {
+    fn forward_inner(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        mut profile: Option<&mut ForwardProfile>,
+    ) -> Result<Tensor> {
         let output = self
             .ctx
             .allocate_output(Shape::new(vec![tokens.len(), VOCAB]), DType::BF16)?;
@@ -358,31 +434,53 @@ impl EagerRunner {
                 .map_err(error)?;
             for layer in &mut self.layers {
                 hidden = match &mut layer.mixer {
-                    Mixer::Gdn { block, state } => {
-                        block.forward_decode(&self.ctx, &hidden, state)?
-                    }
-                    Mixer::Attention { block, cache } => {
-                        block.forward_decode(&self.ctx, &hidden, cache)?
-                    }
+                    Mixer::Gdn { block, state } => timed(
+                        &self.ctx,
+                        profile.as_deref_mut().map(|p| &mut p.gdn_ms),
+                        || block.forward_decode(&self.ctx, &hidden, state),
+                    )?,
+                    Mixer::Attention { block, cache } => timed(
+                        &self.ctx,
+                        profile.as_deref_mut().map(|p| &mut p.attention_ms),
+                        || block.forward_decode(&self.ctx, &hidden, cache),
+                    )?,
                 };
-                hidden = layer.mlp.forward(&self.ctx, &hidden)?;
+                hidden = timed(
+                    &self.ctx,
+                    profile.as_deref_mut().map(|p| &mut p.mlp_ms),
+                    || layer.mlp.forward(&self.ctx, &hidden),
+                )?;
             }
-            let mut normalized = self
-                .ctx
-                .allocate_output(Shape::new(vec![1, HIDDEN]), DType::BF16)?;
-            qwen38::offset_rms_bf16(
+            let normalized = timed(
                 &self.ctx,
-                &hidden,
-                &self.final_norm,
-                &mut normalized,
-                RMS_EPS,
+                profile.as_deref_mut().map(|p| &mut p.final_norm_ms),
+                || {
+                    let mut normalized = self
+                        .ctx
+                        .allocate_output(Shape::new(vec![1, HIDDEN]), DType::BF16)?;
+                    qwen38::offset_rms_bf16(
+                        &self.ctx,
+                        &hidden,
+                        &self.final_norm,
+                        &mut normalized,
+                        RMS_EPS,
+                    )?;
+                    Ok(normalized)
+                },
             )?;
-            let mut logits = self
-                .ctx
-                .allocate_output(Shape::new(vec![1, VOCAB]), DType::BF16)?;
-            ops::gemm(
+            let logits = timed(
                 &self.ctx,
-                ops::GemmArgs::new(&normalized, &self.lm_head, &mut logits),
+                profile.as_deref_mut().map(|p| &mut p.head_ms),
+                || {
+                    let mut logits = self
+                        .ctx
+                        .allocate_output(Shape::new(vec![1, VOCAB]), DType::BF16)?;
+                    ops::gemm(
+                        &self.ctx,
+                        ops::GemmArgs::new(&normalized, &self.lm_head, &mut logits),
+                    )?;
+                    Ok(logits)
+                },
             )?;
             destination
                 .view(index * VOCAB * 2, VOCAB * 2)
@@ -426,6 +524,21 @@ impl EagerRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tuning_requires_healthy_empty_request() {
+        assert!(validate_tuning(0, false).is_ok());
+        assert!(validate_tuning(1, false).is_err());
+        assert!(validate_tuning(0, true).is_err());
+        assert!(validate_tuning(1, true).is_err());
+    }
+    #[test]
+    fn profile_defaults_to_zero() {
+        let p = ForwardProfile::default();
+        assert_eq!(
+            p.gdn_ms + p.attention_ms + p.mlp_ms + p.final_norm_ms + p.head_ms + p.total_ms,
+            0.0
+        );
+    }
     #[test]
     fn exact_text_inventory() {
         assert_eq!(required_names().len(), 851);
