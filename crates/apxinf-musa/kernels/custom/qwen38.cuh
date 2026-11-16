@@ -234,6 +234,52 @@ __global__ void qwen38_rope_kernel(__mt_bfloat16* data, const int* positions,
   row[pair + half] = __float2bfloat16(high * ca + low * sa);
 }
 
+// Device argmax over one BF16 row. Non-finite values are rejected by writing
+// -1; equal finite values retain the lowest index, matching HF/PyTorch argmax.
+__global__ void qwen38_argmax_bf16_kernel(const __mt_bfloat16* values, int count,
+                                          int* output) {
+  __shared__ float best_value[256];
+  __shared__ int best_index[256];
+  __shared__ int saw_nonfinite;
+  if (threadIdx.x == 0) saw_nonfinite = 0;
+  __syncthreads();
+  float value = -INFINITY;
+  int index = count;
+  for (int i = threadIdx.x; i < count; i += blockDim.x) {
+    float candidate = __bfloat162float(values[i]);
+    if (!isfinite(candidate)) atomicExch(&saw_nonfinite, 1);
+    if (isfinite(candidate) && (candidate > value ||
+        (candidate == value && i < index))) {
+      value = candidate;
+      index = i;
+    }
+  }
+  best_value[threadIdx.x] = value;
+  best_index[threadIdx.x] = index;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float best = -INFINITY;
+    int winner = count;
+    for (int i = 0; i < blockDim.x; ++i) {
+      if (best_index[i] < count && (best_value[i] > best ||
+          (best_value[i] == best && best_index[i] < winner))) {
+        best = best_value[i];
+        winner = best_index[i];
+      }
+    }
+    *output = saw_nonfinite ? -1 : winner;
+  }
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_argmax_bf16(
+    const void* values, int count, void* output, musaStream_t stream) {
+  if (!values || !output || count <= 0) return musaErrorInvalidValue;
+  qwen38_argmax_bf16_kernel<<<1, 256, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(values), count,
+      static_cast<int*>(output));
+  return musaGetLastError();
+}
+
 // HF Qwen RMSNorm: form (1 + raw offset) in F32, round only final output.
 __global__ void qwen38_offset_rms_kernel(const __mt_bfloat16* x,
  const __mt_bfloat16* weight, __mt_bfloat16* out, int cols, float eps) {

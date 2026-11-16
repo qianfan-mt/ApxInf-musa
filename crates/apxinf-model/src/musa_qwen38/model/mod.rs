@@ -2,6 +2,7 @@
 
 pub mod mlp;
 pub mod attention;
+pub mod fixed;
 
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 use apxinf_musa::{kernels::qwen38, ops, MusaContext};

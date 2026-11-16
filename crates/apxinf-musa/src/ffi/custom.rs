@@ -418,7 +418,15 @@ extern "C" {
         stream: *mut c_void,
     ) -> musaError_t;
 
-    // ── qwen38 (Qwen3.8-27B) ──────────────────────────────────────────────
+    /// BF16 argmax for one row. Writes lowest-index finite winner, or -1 if
+    /// any input is NaN or infinity.
+    pub fn apxinf_musa_qwen38_argmax_bf16(
+        values: *const c_void,
+        count: i32,
+        output: *mut c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
     /// GDN fused recurrent step: `state` is `[v_heads, v_dim, k_dim]` F32,
     /// read-modify-write in place; q/k `[k_heads, k_dim]`, v `[v_heads, v_dim]`
     /// BF16; decay/beta `[v_heads]` F32 (decay is log-space; kernel applies

@@ -217,6 +217,7 @@ enum Mixer {
     Gdn {
         block: Qwen38GdnBf16Block,
         state: Qwen38GdnBf16State,
+        workspace: crate::musa_qwen38::model::fixed::LayerWorkspace,
     },
     Attention {
         block: AttentionBlock,
@@ -337,6 +338,7 @@ impl EagerRunner {
                         shards.layer(layer, GDN)?,
                     )?),
                     state: Qwen38GdnBf16State::zeroed(&ctx)?,
+                    workspace: crate::musa_qwen38::model::fixed::LayerWorkspace::new(&ctx)?,
                 }
             };
             let mlp = Qwen38MlpBf16::from_hf_layer(&ctx, layer, shards.layer(layer, MLP)?)?;
@@ -434,22 +436,34 @@ impl EagerRunner {
                 .map_err(error)?;
             for layer in &mut self.layers {
                 hidden = match &mut layer.mixer {
-                    Mixer::Gdn { block, state } => timed(
+                    Mixer::Gdn {
+                        block,
+                        state,
+                        workspace,
+                    } => timed(
                         &self.ctx,
                         profile.as_deref_mut().map(|p| &mut p.gdn_ms),
-                        || block.forward_decode(&self.ctx, &hidden, state),
+                        || workspace.forward_decode(
+                            &self.ctx,
+                            &hidden,
+                            state,
+                            block,
+                            &layer.mlp,
+                        ),
                     )?,
-                    Mixer::Attention { block, cache } => timed(
-                        &self.ctx,
-                        profile.as_deref_mut().map(|p| &mut p.attention_ms),
-                        || block.forward_decode(&self.ctx, &hidden, cache),
-                    )?,
+                    Mixer::Attention { block, cache } => {
+                        let hidden = timed(
+                            &self.ctx,
+                            profile.as_deref_mut().map(|p| &mut p.attention_ms),
+                            || block.forward_decode(&self.ctx, &hidden, cache),
+                        )?;
+                        timed(
+                            &self.ctx,
+                            profile.as_deref_mut().map(|p| &mut p.mlp_ms),
+                            || layer.mlp.forward(&self.ctx, &hidden),
+                        )?
+                    }
                 };
-                hidden = timed(
-                    &self.ctx,
-                    profile.as_deref_mut().map(|p| &mut p.mlp_ms),
-                    || layer.mlp.forward(&self.ctx, &hidden),
-                )?;
             }
             let normalized = timed(
                 &self.ctx,

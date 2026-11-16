@@ -58,6 +58,12 @@ fn read_f32(buffer: &MusaBuffer) -> Vec<f32> {
         .collect()
 }
 
+fn read_i32(buffer: &MusaBuffer) -> i32 {
+    let mut bytes = [0u8; 4];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    i32::from_ne_bytes(bytes)
+}
+
 /// The same recurrence the kernel implements, in f64 on the host (from
 /// qwen38_gdn.rs `reference_step`).
 #[allow(clippy::too_many_arguments)]
@@ -600,4 +606,22 @@ fn gated_rms_matches_hf_bf16_cast_points() {
  for d in 0..128 {let i=h*128+d;let norm=round(x[i]/(mean+1e-6).sqrt());
  let want=round(round(norm*w[d])*(z[i]/(1.+(-z[i]).exp())));
  assert!((got[i]-want).abs()<=0.0009765625,"{i}: {} vs {want}",got[i]);}}
+}
+
+#[test]
+fn argmax_bf16_preserves_lowest_tie_and_rejects_nonfinite() {
+    let ctx = MusaContext::new(0).unwrap();
+    for (values, expected) in [
+        (vec![1.0, 4.0, 2.0], 1),
+        (vec![4.0, 4.0, 2.0], 0),
+        (vec![-3.0, -1.0, -2.0], 1),
+        (vec![f32::INFINITY, 1.0], -1),
+        (vec![f32::NAN, 1.0], -1),
+    ] {
+        let (_input_buffer, input) = upload_bf16(&ctx, &values, vec![values.len()]);
+        let (_output_buffer, mut output) = upload_i32(&ctx, &[99], vec![1]);
+        qwen38::argmax_bf16(&ctx, &input, &mut output).unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(read_i32(&_output_buffer), expected);
+    }
 }

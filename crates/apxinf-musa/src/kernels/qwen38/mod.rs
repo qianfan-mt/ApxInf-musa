@@ -47,6 +47,41 @@ fn numel_of(tensor: &Tensor) -> i64 {
     tensor.shape().dims().iter().product::<usize>() as i64
 }
 
+#[cfg(apxinf_musa_available)]
+/// Reduce one BF16 logits row on device into one I32 token index. Lowest index
+/// wins ties; any NaN or infinity is rejected and reported as `-1` in `out`.
+pub fn argmax_bf16(ctx: &MusaContext, logits: &Tensor, out: &mut Tensor) -> Result<()> {
+    if logits.dtype() != DType::BF16 || logits.shape().numel() == 0 {
+        return Err(Error::Other("qwen38 argmax logits must be non-empty BF16".into()));
+    }
+    if out.dtype() != DType::I32 || out.shape().numel() != 1 {
+        return Err(Error::Other("qwen38 argmax output must be one I32".into()));
+    }
+    if logits.device() != apxinf_core::Device::Musa(ctx.device_id())
+        || out.device() != apxinf_core::Device::Musa(ctx.device_id())
+    {
+        return Err(Error::Other("qwen38 argmax tensors must be on the context device".into()));
+    }
+    let count = i32::try_from(logits.shape().numel())
+        .map_err(|_| Error::Other("qwen38 argmax logits exceed i32 count".into()))?;
+    unsafe {
+        check_native(
+            ffi::custom::apxinf_musa_qwen38_argmax_bf16(
+                tensor_ptr(logits)?,
+                count,
+                tensor_ptr(out)?,
+                ctx.stream().handle(),
+            ),
+            "qwen38 argmax_bf16",
+        )
+    }
+}
+
+#[cfg(not(apxinf_musa_available))]
+pub fn argmax_bf16(_ctx: &MusaContext, _logits: &Tensor, _out: &mut Tensor) -> Result<()> {
+    Err(super::native_unavailable("qwen38 argmax_bf16"))
+}
+
 use apxinf_core::DType;
 
 // ── GDN: fused recurrent step ─────────────────────────────────────────────
