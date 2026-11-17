@@ -31,11 +31,11 @@ pub fn linear(ctx: &MusaContext, a: &Tensor, w: W4A16WeightView<'_>, out: &mut T
         let aa=MusaBuffer::from_tensor(a).map_err(Error::Other)?;
         let ss=MusaBuffer::from_tensor(w.scales).map_err(Error::Other)?;
         let cc=MusaBuffer::from_tensor(out).map_err(Error::Other)?;
-        // The native decoder currently implements only the two language MLP
-        // shapes below. Vision shapes must stay on the fused W4 fallback until
-        // matching decode kernels are implemented and validated.
-        let native_pair_shape = dims[0] == 522
-            && matches!((w.n,w.k),(32768,2048)|(2048,16384));
+        // Supported experimental W4 routes: custom KN decode + MuBLAS.
+        let native_pair_shape = matches!((dims[0], w.n, w.k),
+            (522,32768,2048) | (522,2048,16384) |
+            (512,3456,1152) | (512,1152,1152) |
+            (512,4304,1152) | (512,1152,4304));
         if group==16 && native_pair_shape && crate::workspace::w4_native_enabled() {
             let scratch=crate::workspace::w4_session_buffer(ctx,w.n,w.k)?;
             crate::workspace::note_shape(crate::workspace::OperationShape::Gemm {m:dims[0],n:w.n,k:w.k})?;
@@ -45,8 +45,8 @@ pub fn linear(ctx: &MusaContext, a: &Tensor, w: W4A16WeightView<'_>, out: &mut T
             }
             return Ok(());
         }
-        crate::kernels::gemm::launch_w4(ctx,dims[0],w.n,w.k,group,aa.ptr(),w.packed.ptr(),ss.ptr(),cc.ptr())
+        Err(Error::Other(format!("W4 custom decode requires supported shape, G16 and APXINF_MUSA_W4_NATIVE_PAIR=1; got {}x{}x{} G{}", dims[0], w.n, w.k, group)))
     }
     #[cfg(not(apxinf_musa_available))]
-    { let _=(ctx,w,kp); Err(Error::Other("W4A16 requires MUSA TileLang".into())) }
+    { let _=(ctx,w,kp); Err(Error::Other("W4A16 requires MUSA custom decode".into())) }
 }

@@ -1132,12 +1132,30 @@ extern "C" __global__ void __launch_bounds__(128, 1) w4_decode_down(unsigned cha
 
 
 
+extern "C" __global__ void __launch_bounds__(256, 1) w4_decode_generic_kn(const unsigned char* __restrict__ B, const __mt_bfloat16* __restrict__ S, __mt_bfloat16* __restrict__ W, int n, int k) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  long long total = (long long)n * k;
+  if (idx >= total) return;
+  int kk = (int)(idx / n);
+  int nn = (int)(idx - (long long)kk * n);
+  unsigned char byte = B[(long long)nn * (k / 2) + (kk >> 1)];
+  int nibble = (byte >> ((kk & 1) * 4)) & 15;
+  int q = nibble >= 8 ? nibble - 16 : nibble;
+  float value = (float)q * (float)S[(long long)nn * (k / 16) + (kk >> 4)];
+  W[idx] = (__mt_bfloat16)value;
+}
+
 extern "C" musaError_t apxinf_musa_w4_decode_kn(const void* packed, const void* scales, void* scratch, int n, int k, musaStream_t stream) {
-  if (!packed || !scales || !scratch) return musaErrorInvalidValue;
+  if (!packed || !scales || !scratch || n <= 0 || k <= 0 || (k % 16) != 0) return musaErrorInvalidValue;
   if (n==32768 && k==2048) {
     w4_decode_gate<<<dim3(1024,32,1),128,4096,stream>>>((unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch);
   } else if (n==2048 && k==16384) {
     w4_decode_down<<<dim3(64,512,1),128,2048,stream>>>((unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch);
+  } else if ((n==3456 && k==1152) || (n==1152 && k==1152) ||
+             (n==4304 && k==1152) || (n==1152 && k==4304)) {
+    long long total = (long long)n * k;
+    int blocks = (int)((total + 255) / 256);
+    w4_decode_generic_kn<<<blocks,256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
   } else return musaErrorInvalidValue;
   return musaGetLastError();
 }
