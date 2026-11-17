@@ -1145,17 +1145,18 @@ extern "C" __global__ void __launch_bounds__(256, 1) w4_decode_generic_kn(const 
   W[idx] = (__mt_bfloat16)value;
 }
 
+template<int TN, int TK> __global__ void w4_decode_vision_tiled(const unsigned char* B, const __mt_bfloat16* S, __mt_bfloat16* W, int n, int k) { __shared__ __mt_bfloat16 tile[TN][TK + 1]; for (int i=(int)threadIdx.x; i<TN*TK; i+=(int)blockDim.x) { int nn=(int)blockIdx.y*TN+i/TK; int kk=(int)blockIdx.x*TK+i%TK; if (nn<n && kk<k) { unsigned char byte=B[(long long)nn*(k/2)+kk/2]; int q=(byte>>((kk&1)*4))&15; q=q>=8?q-16:q; tile[i/TK][i%TK]=(__mt_bfloat16)((float)q*(float)S[(long long)nn*(k/16)+kk/16]); } } __syncthreads(); for (int i=(int)threadIdx.x; i<TN*TK; i+=(int)blockDim.x) { int nn=(int)blockIdx.y*TN+i%TN; int kk=(int)blockIdx.x*TK+i/TN; if (nn<n && kk<k) W[(long long)kk*n+nn]=tile[i%TN][i/TN]; } }
+
 extern "C" musaError_t apxinf_musa_w4_decode_kn(const void* packed, const void* scales, void* scratch, int n, int k, musaStream_t stream) {
   if (!packed || !scales || !scratch || n <= 0 || k <= 0 || (k % 16) != 0) return musaErrorInvalidValue;
   if (n==32768 && k==2048) {
     w4_decode_gate<<<dim3(1024,32,1),128,4096,stream>>>((unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch);
   } else if (n==2048 && k==16384) {
     w4_decode_down<<<dim3(64,512,1),128,2048,stream>>>((unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch);
-  } else if ((n==3456 && k==1152) || (n==1152 && k==1152) ||
-             (n==4304 && k==1152) || (n==1152 && k==4304)) {
-    long long total = (long long)n * k;
-    int blocks = (int)((total + 255) / 256);
-    w4_decode_generic_kn<<<blocks,256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
+  } else if (n==3456 && k==1152) { w4_decode_vision_tiled<64,32><<<dim3((k+31)/32,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
+  } else if (n==1152 && k==1152) { w4_decode_vision_tiled<64,32><<<dim3((k+31)/32,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
+  } else if (n==4304 && k==1152) { w4_decode_vision_tiled<64,32><<<dim3((k+31)/32,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
+  } else if (n==1152 && k==4304) { w4_decode_vision_tiled<64,32><<<dim3((k+31)/32,(n+63)/64),256,0,stream>>>((const unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch,n,k);
   } else return musaErrorInvalidValue;
   return musaGetLastError();
 }
