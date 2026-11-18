@@ -126,19 +126,27 @@ fn launch(
     cols: usize,
     tactic: TacticDispatch,
 ) -> Result<()> {
+    let trace = std::env::var_os("APXINF_TRACE_GEMM").is_some();
     if super::in_decode_scope()
         && super::tilelang::launch_bf16(ctx, activation, weight, output, rows, cols, inner)?
     {
+        if trace {
+            eprintln!("[gemm-trace] m={rows} n={cols} k={inner} backend=tilelang");
+        }
         return Ok(());
     }
-    let assembly = if super::in_decode_scope() {
-        super::assembly::launch(ctx, activation, weight, output, rows, cols, inner)?
-    } else if super::assembly::launch_exact(ctx, activation, weight, output, rows, cols, inner)? {
+    // Decode scope only selects the exact TileLang path above.  Unsupported
+    // shapes must retain the normal exact/encode fallback; forcing every GEMM
+    // through the decode assembly path regresses the rest of GR00T.
+    let assembly = if super::assembly::launch_exact(ctx, activation, weight, output, rows, cols, inner)? {
         true
     } else {
         super::assembly::launch_encode(ctx, activation, weight, output, rows, cols, inner)?
     };
     if assembly {
+        if trace {
+            eprintln!("[gemm-trace] m={rows} n={cols} k={inner} backend=assembly");
+        }
         return Ok(());
     }
     let tuning = ctx.tuning();
@@ -180,6 +188,9 @@ fn launch(
             crate::tuning::Bf16Provider::Mublas
         }
     };
+    if trace {
+        eprintln!("[gemm-trace] m={rows} n={cols} k={inner} backend={provider:?}");
+    }
     dispatch(ctx, activation, weight, output, rows, cols, inner, provider)
 }
 

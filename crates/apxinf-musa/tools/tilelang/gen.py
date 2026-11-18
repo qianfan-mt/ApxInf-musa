@@ -83,7 +83,13 @@ def load_module(py: Path):
 
 def tilelang_root() -> Path:
     import tilelang
-    return Path(tilelang.__file__).resolve().parent.parent
+    package = Path(tilelang.__file__).resolve().parent
+    # The source checkout has package/__init__.py beside src/, while a wheel
+    # has package/src/.  Select the root that actually owns the headers.
+    for root in (package.parent, package):
+        if (root / "src" / "tl_templates" / "musa" / "common.h").exists():
+            return root
+    raise RuntimeError("TileLang installation has no tl_templates/musa/common.h")
 
 
 def rename_symbols(source: str, entry: str) -> str:
@@ -211,6 +217,8 @@ def main() -> int:
 
         artifacts.append({
             "id": op["id"], "type": op["type"], "shape": list(op["shape"]),
+            "packed_n": op.get("packed_n", op["shape"][1]),
+            "packed_k": op.get("packed_k", op["shape"][2]),
             "status": op["status"],
             "scratch_bytes": scratch_bytes,
             "entries": entries,
@@ -225,9 +233,11 @@ def main() -> int:
         assert key not in seen, f"duplicate TileLang shape {key}: {a['id']}"
         seen.add(key)
 
-    inventory_path.write_text(json.dumps(
+    inventory_tmp = inventory_path.with_suffix(".json.tmp")
+    inventory_tmp.write_text(json.dumps(
         {"generated_by": GENERATED_BY, "artifacts": artifacts},
         indent=2) + "\n")
+    inventory_tmp.replace(inventory_path)
     print(f"generated {len(artifacts)} kernels -> {inventory_path}")
     return 0
 

@@ -104,8 +104,17 @@ pub fn generate(artifacts: &[Value], directory: &Path) -> Result<Dispatch, Strin
             "experimental" => "TilelangStatus::Experimental",
             _ => "TilelangStatus::Off",
         };
+        let packed = if spec.row_type == "TilelangBf16Gemm" {
+            format!(
+                "packed_n: {}, packed_k: {}, ",
+                artifact["packed_n"].as_u64().unwrap_or(shape[1].as_u64().unwrap()),
+                artifact["packed_k"].as_u64().unwrap_or(shape[2].as_u64().unwrap())
+            )
+        } else {
+            String::new()
+        };
         let mut row = format!(
-            "    {} {{ m: {}, n: {}, k: {}, status: {status}, scratch: {}, ",
+            "    {} {{ m: {}, n: {}, k: {}, {packed}status: {status}, scratch: {}, ",
             spec.row_type,
             shape[0],
             shape[1],

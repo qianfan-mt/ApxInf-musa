@@ -71,6 +71,8 @@ pub(crate) struct TilelangBf16Gemm {
     m: usize,
     n: usize,
     k: usize,
+    packed_n: usize,
+    packed_k: usize,
     status: TilelangStatus,
     scratch: usize,
     part: PartFn,
@@ -188,6 +190,13 @@ fn serves_bf16(m: usize, n: usize, k: usize) -> Option<&'static TilelangBf16Gemm
         .find(|op| (op.m, op.n, op.k) == (m, n, k) && op.status == TilelangStatus::Enabled)
 }
 
+// The M=1 GR00T FMA kernel reads a transposed weight; the M=40/41
+// kernels for the same N/K read the MMA fragment layout. Other registered
+// shapes do not share N/K across different packing formats.
+fn bf16_transposed_pack(op: &TilelangBf16Gemm) -> bool {
+    op.m == 1
+}
+
 fn initialize(init: InitFn, ready: &AtomicBool) -> Result<()> {
     if !ready.load(Ordering::Acquire) {
         if unsafe { init() } != 0 {
@@ -206,9 +215,15 @@ pub(super) fn prepare_bf16_weight(ctx: &MusaContext, weight: &Tensor) -> Result<
         return Ok(());
     }
     let (k, n) = (dims[0], dims[1]);
-    let Some(op) = serves_bf16(10, n, k) else {
+    if policy_off() {
         return Ok(());
-    };
+    }
+    let ops = TILELANG_BF16_GEMMS
+        .iter()
+        .filter(|op| op.n == n && op.k == k && op.status == TilelangStatus::Enabled);
+    if ops.clone().next().is_none() {
+        return Ok(());
+    }
     if crate::workspace::is_capturing() {
         return Err(Error::Other(
             "prepare BF16 TileLang weights before graph capture".into(),
@@ -219,25 +234,31 @@ pub(super) fn prepare_bf16_weight(ctx: &MusaContext, weight: &Tensor) -> Result<
         .lock()
         .map_err(|_| Error::Other("BF16 prepared-weight lock poisoned".into()))?;
     let source = tensor_ptr(weight)?;
-    let key = (source as usize, k, n);
-    if weights.tilelang.contains_key(&key) {
-        return Ok(());
+    for op in ops {
+        let key = (source as usize, k, n, bf16_transposed_pack(op));
+        if weights.tilelang.contains_key(&key) {
+            continue;
+        }
+        initialize(op.pack_init, &op.pack_ready)?;
+        // Match the generated packer: padded K tiles by padded N tiles.
+        let tile_k = 64;
+        let k_tiles = op.packed_k.div_ceil(tile_k);
+        let packed_elems = k_tiles * tile_k * op.packed_n;
+        let packed = crate::MusaBuffer::alloc_on(ctx, packed_elems * 2)
+            .map_err(crate::error::musa_error)?
+            .into_tensor(Shape::new(vec![packed_elems]), DType::BF16);
+        if unsafe { (op.pack)(source, tensor_ptr(&packed)?, ctx.stream().handle()) } != 0 {
+            return Err(Error::Other(
+                "BF16 TileLang weight preparation failed".into(),
+            ));
+        }
+        weights.tilelang.insert(key, packed);
     }
-    initialize(op.pack_init, &op.pack_ready)?;
-    let packed = crate::MusaBuffer::alloc_on(ctx, k * n * 2)
-        .map_err(crate::error::musa_error)?
-        .into_tensor(Shape::new(vec![k * n]), DType::BF16);
-    if unsafe { (op.pack)(source, tensor_ptr(&packed)?, ctx.stream().handle()) } != 0 {
-        return Err(Error::Other(
-            "BF16 TileLang weight preparation failed".into(),
-        ));
-    }
-    weights.tilelang.insert(key, packed);
     Ok(())
 }
 
 /// Exact-shape BF16 decode dispatch; unsupported or disabled entries stay native.
-pub(super) fn launch_bf16(
+pub(crate) fn launch_bf16(
     ctx: &MusaContext,
     activation: &Tensor,
     weight: &Tensor,
@@ -249,7 +270,7 @@ pub(super) fn launch_bf16(
     let Some(op) = serves_bf16(m, n, k) else {
         return Ok(false);
     };
-    let key = (tensor_ptr(weight)? as usize, k, n);
+    let key = (tensor_ptr(weight)? as usize, k, n, bf16_transposed_pack(op));
     let packed = ctx
         .asm_weights
         .lock()
@@ -266,21 +287,14 @@ pub(super) fn launch_bf16(
     } else {
         None
     };
+    let activation_ptr = tensor_ptr(activation)?;
     let destination = if let Some(buffer) = &scratch {
         buffer.ptr()
     } else {
         tensor_ptr(output)?
     };
     let stream = ctx.stream().handle();
-    if unsafe {
-        (op.part)(
-            tensor_ptr(activation)?,
-            tensor_ptr(&packed)?,
-            destination,
-            stream,
-        )
-    } != 0
-    {
+    if unsafe { (op.part)(activation_ptr, tensor_ptr(&packed)?, destination, stream) } != 0 {
         return Err(Error::Other("BF16 TileLang GEMM failed".into()));
     }
     if let (Some(reduce), Some(init)) = (op.reduce, op.reduce_init) {
