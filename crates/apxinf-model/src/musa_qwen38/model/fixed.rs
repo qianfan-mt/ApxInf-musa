@@ -5,9 +5,9 @@
 //! graph-capture support.
 
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
-use apxinf_musa::{kernels::qwen38, ops, MusaBuffer, MusaContext};
-use super::{Qwen38GdnBf16Block, Qwen38GdnBf16State};
+use apxinf_musa::{kernels::qwen38, native_gdn::NativeGdnLauncher, ops, transfers, MusaBuffer, MusaContext};
 use super::mlp::Qwen38MlpBf16;
+use super::{Qwen38GdnBf16Block, Qwen38GdnBf16State};
 
 const HIDDEN: usize = 5120;
 const QKV: usize = 10240;
@@ -54,6 +54,10 @@ pub struct LayerWorkspace {
     packed: Tensor,
     activation: Tensor,
     output: Tensor,
+    native_gdn_enabled: bool,
+    native_gdn: Option<NativeGdnLauncher>,
+    native_a_log: Option<Tensor>,
+    native_dt_bias: Option<Tensor>,
 }
 
 impl LayerWorkspace {
@@ -76,7 +80,38 @@ impl LayerWorkspace {
             packed: buffer_tensor(ctx, vec![1, 2 * INTERMEDIATE], DType::BF16)?,
             activation: buffer_tensor(ctx, vec![1, INTERMEDIATE], DType::BF16)?,
             output: buffer_tensor(ctx, vec![1, HIDDEN], DType::BF16)?,
+            native_gdn: NativeGdnLauncher::from_env(ctx.device_id()).map_err(Error::Other)?,
+            native_a_log: None,
+            native_dt_bias: None,
+            native_gdn_enabled: std::env::var_os("APXINF_MUSA_NATIVE_GDN_LIB").is_some(),
         })
+    }
+
+    fn prepare_native_constants(
+        &mut self,
+        ctx: &MusaContext,
+        gdn: &Qwen38GdnBf16Block,
+    ) -> Result<()> {
+        if self.native_a_log.is_some() {
+            return Ok(());
+        }
+        let a_log = transfers::to_cpu(&gdn.weights.a_log)?;
+        let dt_bias = transfers::to_cpu(&gdn.weights.dt_bias)?;
+        let a_log_values: Vec<f32> = a_log.as_bf16()?.iter().map(|v| v.to_f32()).collect();
+        let dt_bias_values: Vec<f32> = dt_bias.as_bf16()?.iter().map(|v| v.to_f32()).collect();
+        self.native_a_log = Some(transfers::to_device(
+            &Tensor::from_f32(vec![V_HEADS], &a_log_values)?,
+            ctx.device_id(),
+        )?);
+        self.native_dt_bias = Some(transfers::to_device(
+            &Tensor::from_f32(vec![V_HEADS], &dt_bias_values)?,
+            ctx.device_id(),
+        )?);
+        Ok(())
+    }
+
+    pub fn native_gdn_enabled(&self) -> bool {
+        self.native_gdn_enabled
     }
 
     /// Run GDN followed by MLP, advancing `state` exactly as the eager block.
@@ -100,10 +135,27 @@ impl LayerWorkspace {
         let mut q = view(&self.conv, 0, 2048, vec![16, HEAD_DIM])?;
         let mut k = view(&self.conv, 2048, 2048, vec![16, HEAD_DIM])?;
         let v = view(&self.conv, 4096, 6144, vec![V_HEADS, HEAD_DIM])?;
-        qwen38::gdn_l2_normalize_heads(ctx, &mut q, EPSILON)?;
-        qwen38::gdn_l2_normalize_heads(ctx, &mut k, EPSILON)?;
-        qwen38::gdn_decay_beta_step(ctx, &self.a.reshape(vec![AB])?, &self.b.reshape(vec![AB])?, &gdn.weights.a_log, &gdn.weights.dt_bias, &mut self.decay, &mut self.beta)?;
-        qwen38::gdn_recurrent_step(ctx, &mut state.recurrent, &q, &k, &v, &self.decay, &self.beta, &mut self.readout)?;
+        if self.native_gdn_enabled {
+            self.prepare_native_constants(ctx, gdn)?;
+            let launcher = self.native_gdn.as_ref().ok_or_else(|| Error::Other("native GDN enabled without launcher".into()))?;
+            launcher.launch(
+                ctx,
+                &q,
+                &k,
+                &v,
+                self.native_a_log.as_ref().ok_or_else(|| Error::Other("native GDN missing A_log".into()))?,
+                &self.a.reshape(vec![AB])?,
+                self.native_dt_bias.as_ref().ok_or_else(|| Error::Other("native GDN missing dt_bias".into()))?,
+                &self.b.reshape(vec![AB])?,
+                &mut state.recurrent,
+                &mut self.readout,
+            ).map_err(Error::Other)?;
+        } else {
+            qwen38::gdn_l2_normalize_heads(ctx, &mut q, EPSILON)?;
+            qwen38::gdn_l2_normalize_heads(ctx, &mut k, EPSILON)?;
+            qwen38::gdn_decay_beta_step(ctx, &self.a.reshape(vec![AB])?, &self.b.reshape(vec![AB])?, &gdn.weights.a_log, &gdn.weights.dt_bias, &mut self.decay, &mut self.beta)?;
+            qwen38::gdn_recurrent_step(ctx, &mut state.recurrent, &q, &k, &v, &self.decay, &self.beta, &mut self.readout)?;
+        }
         qwen38::gated_rms_bf16(ctx, &self.readout, &gdn.weights.gdn_norm, &self.z.reshape(vec![V_HEADS, HEAD_DIM])?, &mut self.gated, EPSILON)?;
         gemm_into(ctx, &self.gated.reshape(vec![1, Z])?, &gdn.weights.out, &mut self.gdn_output)?;
         qwen38::add_into(ctx, &mut self.gdn_output, hidden)?;

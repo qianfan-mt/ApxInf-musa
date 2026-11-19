@@ -29,6 +29,7 @@ mod graph;
 pub mod kernels;
 pub mod ops;
 pub mod mttx;
+pub mod native_gdn;
 pub mod sampling;
 pub mod stream;
 pub mod transfers;

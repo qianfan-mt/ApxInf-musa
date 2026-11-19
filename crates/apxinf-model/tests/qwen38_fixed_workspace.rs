@@ -115,6 +115,13 @@ fn fixed_workspace_matches_eager_output_and_state() {
 }
 
 #[test]
+fn fixed_workspace_native_gdn_is_disabled_by_default() {
+    let ctx = MusaContext::new(0).unwrap();
+    let workspace = LayerWorkspace::new(&ctx).unwrap();
+    assert!(!workspace.native_gdn_enabled());
+}
+
+#[test]
 fn fixed_workspace_reuses_storage_between_calls() {
     let ctx = MusaContext::new(0).unwrap();
     let (gdn_weights, mlp) = test_weights(&ctx);
