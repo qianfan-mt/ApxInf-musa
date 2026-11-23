@@ -1,0 +1,75 @@
+#include <tl_templates/musa/common.h>
+__device__ __forceinline__ float row_reduce(float v, bool is_max) {
+  for (int bit = 1; bit < GROUP_SIZE; bit <<= 1) {
+    int bits = __musa_shfl_xor_sync_i32(__float_as_int(v), bit, 127);
+    float other = __int_as_float(bits);
+    v = is_max ? __musa_fmax_f(v, other) : v + other;
+  }
+  return v;
+}
+__device__ __forceinline__ void row_softmax(const float* input,
+                                            mutlass::bfloat16_t* output,
+                                            float* denom, int n) {
+  input += (threadIdx.x / GROUP_SIZE) * n;
+  output += (threadIdx.x / GROUP_SIZE) * n;
+  denom += threadIdx.x / GROUP_SIZE;
+  const int lane = threadIdx.x % GROUP_SIZE;
+  float cached[CACHE_SIZE];
+  float maximum = -INFINITY;
+#pragma unroll
+  for (int j = 0; j < CACHE_SIZE; ++j) {
+    int i = lane + j * GROUP_SIZE;
+    cached[j] = i < n ? input[i] : -INFINITY;
+    maximum = __musa_fmax_f(maximum, cached[j]);
+  }
+  maximum = row_reduce(maximum, true);
+  float sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < CACHE_SIZE; ++j) {
+    int i = lane + j * GROUP_SIZE;
+    float v = __musa_exp2_f((cached[j] - maximum) * 0.09016844005556022f);
+    sum += v;
+    if (i < n) output[i] = mutlass::bfloat16_t(v);
+  }
+  sum = row_reduce(sum, false);
+  if (lane == 0) *denom = sum;
+}
+
+
+#include <tl_templates/musa/common.h>
+#include <tl_templates/musa/gemm.h>
+__device__ __forceinline__ void pv_compute_cta(const bfloat16_t* P,
+                                             const bfloat16_t* V,
+                                             const float* D, bfloat16_t* O,
+                                             float* partial, int br, int bc,
+                                             int kv) {
+  int t = threadIdx.x % 128, split = threadIdx.x / 128,
+      src = ((t & 63) / 4) * 8 + (t / 64) * 4 + (t & 3), tiles = (kv + 31) / 32;
+  bfloat16_t p[8], v[8];
+  float acc[8] = {0};
+  for (int block = split * tiles / SPLITS; block < (split + 1) * tiles / SPLITS;
+       ++block) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      int row = br * 32 + (r & 1) * 16 + src / 8,
+          col = block * 32 + (r / 2) * 16 + (src & 7) * 2;
+      ((unsigned*)p)[r] =
+          row < 80 && col + 1 < kv ? *(const unsigned*)(P + row * kv + col) : 0;
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      int row = block * 32 + (r / 2) * 16 + t / 8,
+          col = bc * 32 + (r % 2) * 16 + (t & 7) * 2;
+      ((unsigned*)v)[r] =
+          row < kv ? *(const unsigned*)(V + row * 256 + col) : 0;
+    }
+    tl::gemm_rr<32, 32, 32, 1, 1, 0, 0, 0, 32, 32, 0, 0>(p, v, acc);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int row = ((i & 7) / 2) * 8 + (t / 64) * 4 + (t % 32) / 8,
+        col = (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+    partial[(split * 32 + row) * 32 + col] = acc[i];
+  }
+  __syncthreads();
+}

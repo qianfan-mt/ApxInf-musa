@@ -849,7 +849,10 @@ fn tilelang_kernels(
     let mut kernel_sources = Vec::new();
     collect_tree(&kernels, &mut kernel_sources);
     for path in kernel_sources {
-        if path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("py") | Some("muh")
+        ) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }

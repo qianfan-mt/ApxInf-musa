@@ -21,10 +21,9 @@ pub enum AttentionMask {
 /// are both satisfied.
 #[derive(Clone, Debug)]
 pub struct AttentionPolicy {
-    /// Bounds the bytes the operator allocates for itself. Attention writes only
-    /// the caller's output and allocates no intermediate, so any limit —
-    /// including zero — is satisfied. Vendor-library internal workspaces are
-    /// outside this backend's accounting.
+    /// Bounds backend-owned scratch per call. TileLang prefix/action stages
+    /// use arena scratch and retain the native route when it exceeds this limit.
+    /// Vendor-library internal workspaces are outside this accounting.
     pub workspace_limit: usize,
     /// `false` requires the measured packed decode route for a decode-shaped
     /// call, per build: the assembly build's packed decode kernel, or the

@@ -1,6 +1,8 @@
 //! Attention operator contracts.
 
 pub(crate) mod mp31;
+#[cfg(apxinf_musa_available)]
+pub(crate) mod tilelang;
 
 #[cfg(apxinf_musa_available)]
 use std::ffi::c_void;
@@ -372,6 +374,21 @@ pub(crate) fn mqa_bf16_into_with_workspace(
         v,
         output,
         [tokens, heads, head_dim, available, key_tokens],
+        workspace_limit,
+    )? {
+        return Ok(());
+    }
+    #[cfg(apxinf_musa_available)]
+    if tilelang::try_mqa(
+        ctx,
+        q,
+        k,
+        v,
+        output,
+        tokens,
+        available,
+        key_tokens,
+        tactic,
         workspace_limit,
     )? {
         return Ok(());
@@ -768,6 +785,14 @@ fn launch_mha(
     let flash = *FLASH_ENABLED.get_or_init(|| {
         std::env::var("APXINF_MUSA_BF16_MHA").map_or(true, |value| value != "legacy")
     });
+    if flash
+        && heads == 16
+        && head_dim == 72
+        && rows == 256
+        && tilelang::try_vision(ctx, q, k, v, output, batches)?
+    {
+        return Ok(());
+    }
     // Which generations have the muDNN flash kernel is the family's answer, not
     // a pair of numbers written here: a list at the dispatch site is a list a
     // new generation falls off silently, keeping the correct-but-slower path

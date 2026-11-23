@@ -29,7 +29,78 @@ const PART: Stage = Stage {
     optional: false,
 };
 
+const THREE: &[(&str, &str)] = &[("a", PTR), ("b", PTR), ("c", PTR), ("stream", PTR)];
+const FOUR: &[(&str, &str)] = &[
+    ("a", PTR),
+    ("b", PTR),
+    ("c", PTR),
+    ("d", PTR),
+    ("stream", PTR),
+];
+const FIVE: &[(&str, &str)] = &[
+    ("a", PTR),
+    ("b", PTR),
+    ("c", PTR),
+    ("d", PTR),
+    ("e", PTR),
+    ("stream", PTR),
+];
+
 const OPERATOR_TYPES: &[OperatorType] = &[
+    OperatorType {
+        name: "attention-prefix-bf16",
+        table: "TILELANG_PREFIX",
+        row_type: "TilelangPrefix",
+        stages: &[
+            Stage {
+                role: "pack",
+                parameters: FOUR,
+                optional: false,
+            },
+            Stage {
+                role: "fast",
+                parameters: FIVE,
+                optional: false,
+            },
+            Stage {
+                role: "fallback",
+                parameters: FIVE,
+                optional: false,
+            },
+        ],
+    },
+    OperatorType {
+        name: "attention-action-bf16",
+        table: "TILELANG_ACTION",
+        row_type: "TilelangAction",
+        stages: &[
+            Stage {
+                role: "qk",
+                parameters: THREE,
+                optional: false,
+            },
+            Stage {
+                role: "softmax",
+                parameters: THREE,
+                optional: false,
+            },
+            Stage {
+                role: "pv",
+                parameters: FOUR,
+                optional: false,
+            },
+        ],
+    },
+    OperatorType {
+        name: "attention-vision-bf16",
+        table: "TILELANG_VISION",
+        row_type: "TilelangVision",
+        stages: &[Stage {
+            role: "run",
+            parameters: FOUR,
+            optional: false,
+        }],
+    },
     OperatorType {
         name: "gemm-splitk-int8",
         table: "TILELANG_GEMMS",
@@ -107,8 +178,12 @@ pub fn generate(artifacts: &[Value], directory: &Path) -> Result<Dispatch, Strin
         let packed = if spec.row_type == "TilelangBf16Gemm" {
             format!(
                 "packed_n: {}, packed_k: {}, ",
-                artifact["packed_n"].as_u64().unwrap_or(shape[1].as_u64().unwrap()),
-                artifact["packed_k"].as_u64().unwrap_or(shape[2].as_u64().unwrap())
+                artifact["packed_n"]
+                    .as_u64()
+                    .unwrap_or(shape[1].as_u64().unwrap()),
+                artifact["packed_k"]
+                    .as_u64()
+                    .unwrap_or(shape[2].as_u64().unwrap())
             )
         } else {
             String::new()
@@ -163,7 +238,7 @@ pub fn generate(artifacts: &[Value], directory: &Path) -> Result<Dispatch, Strin
     }
     for (spec, rows) in OPERATOR_TYPES.iter().zip(rows) {
         source.push_str(&format!(
-            "pub(super) static {}: [{}; {}] = [\n{}];\n",
+            "pub(crate) static {}: [{}; {}] = [\n{}];\n",
             spec.table,
             spec.row_type,
             rows.len(),

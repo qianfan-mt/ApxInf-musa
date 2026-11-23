@@ -28,7 +28,7 @@ MCC = MUSA_PATH / "bin" / "mcc"
 # 已知 offload arch → __MUSA_ARCH_LIST__ 数值；新架构两处一起加。
 ARCH_NUM = {"mp_22": "220"}
 # 契约版本：旧 inventory 无 def_hash 字段，首跑自动全量重建。
-GENERATED_BY = "apxinf-tilelang-gen/6"
+GENERATED_BY = "apxinf-tilelang-gen/7"
 
 
 def fnv1a(path: Path) -> str:
@@ -47,15 +47,16 @@ def fnv1a_bytes(data: bytes) -> str:
 
 
 def op_definition_digest(py: Path, op: dict, entries: dict, target: dict) -> str:
-    """算子的输入身份：定义文件字节 + 算子参数 + 入口符号 + 生成器本体 + 契约版本。
+    """算子的输入身份：源文件字节 + 算子参数 + 入口符号 + 生成器本体 + 契约版本。
 
-    编辑 tile/shape/flags、入口编号位移（插入新算子）、或 gen.py 自身变化，
+    Python 定义和它们引用的设备源码都参与哈希。编辑 tile/shape/flags、入口
+    编号位移（插入新算子）、attention 的 .muh 设备头文件、或 gen.py 自身变化，
     都会改变 def_hash 从而强制重编——缓存键必须是输入身份，而非输出指纹。
     """
+    source_files = sorted(set(KERNELS.rglob("*.py")) | set(KERNELS.rglob("*.muh")))
     payload = b"\x00".join([
-        py.read_bytes(),
-        b"".join(path.relative_to(KERNELS).as_posix().encode() + path.read_bytes()
-                 for path in sorted(KERNELS.rglob("*.py"))),
+        b"".join(path.relative_to(KERNELS).as_posix().encode() + b"\x00" + path.read_bytes()
+                 for path in source_files),
         json.dumps(op, sort_keys=True, ensure_ascii=False).encode(),
         json.dumps(entries, sort_keys=True).encode(),
         Path(__file__).read_bytes(),
@@ -210,7 +211,7 @@ def main() -> int:
                 mu_file.write_text(rename_symbols(
                     sources[role], entries[role]))
                 target = args.out / f"{op['id']}.{role}.o"
-                compile_object(mu_file, target, op.get("flags", []),
+                compile_object(mu_file, target, op.get("stage_flags", {}).get(role, op.get("flags", [])),
                                mcc, args.arch, arch_num)
                 mu_file.unlink()  # 源文件仅编译期需要，不入产物目录
                 cached[role] = {"file": target.name, "digest": fnv1a(target)}

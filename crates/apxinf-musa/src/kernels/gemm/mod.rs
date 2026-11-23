@@ -22,7 +22,7 @@ pub(crate) mod mp31_fp8;
 #[cfg_attr(not(apxinf_musa_available), allow(dead_code))]
 mod qint8_tiles;
 #[cfg(apxinf_musa_available)]
-mod tilelang;
+pub(crate) mod tilelang;
 mod w8a8;
 
 fn prepare_bf16_weight_common(

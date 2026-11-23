@@ -1,0 +1,539 @@
+// VARIANT_COMPACT_BEGIN
+#include <tl_templates/musa/common.h>
+#include <tl_templates/musa/gemm.h>
+__device__ __forceinline__ void row_reduce(const float* src, float* dst,
+                                           bool mx) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float v =
+        mx ? __musa_fmax_f(__musa_fmax_f(src[2 * i], src[2 * i + 1]),
+                           __musa_fmax_f(src[2 * i + 8], src[2 * i + 9]))
+           : src[2 * i] + src[2 * i + 1] + src[2 * i + 8] + src[2 * i + 9];
+#pragma unroll
+    for (int bit = 1; bit <= 32; bit *= 2) {
+      if (bit == 8 || bit == 16) continue;
+      float x =
+          __int_as_float(__musa_shfl_xor_sync_i32(__float_as_int(v), bit, 127));
+      v = mx ? __musa_fmax_f(v, x) : v + x;
+    }
+    dst[i] = v;
+  }
+}
+__device__ __forceinline__ void cast_scores(const float* s, unsigned* p) {
+  int t = threadIdx.x % 128;
+#pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    int i = (r % 2) * 16 + (t % 64) / 4,
+        j = (r / 2) * 16 + (t / 64) * 8 + (t % 4) * 2,
+        base = (r % 2) * 4 + ((r / 2) % 2) + (r / 4) * 8;
+    int source = (i % 8 / 4) * 64 + (j % 16 / 8) * 32 + (i % 4) * 8 + j % 8;
+    unsigned pair = unsigned(bfloat16_t(s[base]).raw()) |
+                    (unsigned(bfloat16_t(s[base + 2]).raw()) << 16);
+    unsigned lo = __musa_shfl_idx_sync_i32(pair, source, 127),
+             hi = __musa_shfl_idx_sync_i32(pair, source + 1, 127);
+    int shift = ((t / 32) % 2) * 16;
+    p[r] = ((lo >> shift) & 65535u) | (((hi >> shift) & 65535u) << 16);
+  }
+}
+__device__ __forceinline__ void row_reduce32(const float* src, float* dst,
+                                             bool mx) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float v = mx ? __musa_fmax_f(src[2 * i], src[2 * i + 1])
+                 : src[2 * i] + src[2 * i + 1];
+#pragma unroll
+    for (int bit = 1; bit <= 32; bit *= 2) {
+      if (bit == 8 || bit == 16) continue;
+      float x =
+          __int_as_float(__musa_shfl_xor_sync_i32(__float_as_int(v), bit, 127));
+      v = mx ? __musa_fmax_f(v, x) : v + x;
+    }
+    dst[i] = v;
+  }
+}
+__device__ __forceinline__ void cast_scores32(const float* s, unsigned* p) {
+  int t = threadIdx.x % 128;
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    int i = (r % 2) * 16 + (t % 64) / 4,
+        j = (r / 2) * 16 + (t / 64) * 8 + (t % 4) * 2,
+        base = (r % 2) * 4 + r / 2;
+    int source = (i % 8 / 4) * 64 + (j % 16 / 8) * 32 + (i % 4) * 8 + j % 8;
+    unsigned pair = unsigned(bfloat16_t(s[base]).raw()) |
+                    (unsigned(bfloat16_t(s[base + 2]).raw()) << 16);
+    unsigned lo = __musa_shfl_idx_sync_i32(pair, source, 127),
+             hi = __musa_shfl_idx_sync_i32(pair, source + 1, 127);
+    int shift = ((t / 32) % 2) * 16;
+    p[r] = ((lo >> shift) & 65535u) | (((hi >> shift) & 65535u) << 16);
+  }
+}
+__device__ __forceinline__ int any128(int value) {
+  int result = __any_sync(0xffffffffu, value);
+  result |= __musa_shfl_xor_sync_i32(result, 32, 127);
+  result |= __musa_shfl_xor_sync_i32(result, 64, 127);
+  result |= __musa_shfl_xor_sync_i32(result, 96, 127);
+  return result;
+}
+__device__ __forceinline__ void prefix_online(const bfloat16_t* Q,
+                                              const bfloat16_t* K,
+                                              const bfloat16_t* V,
+                                              bfloat16_t* O, int br, int kv, int group,
+                                              void* memory) {
+  br = br * group + threadIdx.x / 128;
+  int t = threadIdx.x % 128, src = ((t & 63) / 4) * 8 + (t / 64) * 4 + (t & 3);
+  int base = 0;
+  alignas(16) bfloat16_t q[64], k[64], v[64];
+  unsigned p[4];
+  float acc[64] = {0}, s[8],
+        m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, den[4] = {0}, z[4],
+        next[4], alpha[4];
+#pragma unroll
+  for (int r = 0; r < 32; ++r) {
+    int row = (r & 1) * 16 + src / 8, col = (r / 2) * 16 + (src & 7) * 2;
+    ((unsigned*)q)[r] =
+        br * 32 + row < kv * 8
+            ? __ldg((const unsigned*)(Q + base + (br * 32 + row) * 256 + col))
+            : 0;
+  }
+  for (int bk = 0; bk < (kv + 31) / 32; ++bk) {
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      ((uint4*)k)[kp] =
+          __ldg((const uint4*)(K + bk * 8192 + kp * 1024 + t * 8));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = 0;
+    tl::gemm_rr<32, 32, 256, 1, 1, 0, 1, 0, 256, 256, 0, 0>(q, k, s);
+    for (int i = 0; i < 8; ++i) {
+      int col = (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+      if (bk * 32 + col >= kv) s[i] = -INFINITY;
+    }
+    row_reduce32(s, next, true);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      next[i] = __musa_fmax_f(m[i], next[i]);
+      alpha[i] = __musa_exp2_f((m[i] - next[i]) * 0.09016844005556022f);
+      m[i] = next[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      s[i] = __musa_exp2_f((s[i] - m[i / 2]) * 0.09016844005556022f);
+    row_reduce32(s, z, false);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) den[i] = den[i] * alpha[i] + z[i];
+    cast_scores32(s, p);
+#pragma unroll
+    for (int i = 0; i < 64; ++i) acc[i] *= alpha[(i & 7) / 2];
+#pragma unroll
+    for (int kc = 0; kc < 2; ++kc) {
+#pragma unroll
+      for (int nc = 0; nc < 4; ++nc)
+        ((uint4*)v)[kc * 4 + nc] = __ldg(
+            (const uint4*)(V + bk * 8192 + kc * 4096 + nc * 1024 + t * 8));
+    }
+    tl::gemm_rr<32, 256, 32, 1, 1, 0, 0, 0, 32, 256, 0, 0>(
+        reinterpret_cast<bfloat16_t*>(p), v, acc);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; ++i) den[i] = __frcp_rn(den[i]);
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    int row = br * 32 + ((i & 7) / 2) * 8 + (t / 64) * 4 + (t % 32) / 8;
+    int col = (i / 8) * 32 + (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+    if (row < kv * 8)
+      O[base + row * 256 + col] = bfloat16_t(acc[i] * den[(i & 7) / 2]);
+  }
+}
+
+__device__ __forceinline__ void prefix_fast(const bfloat16_t* Q,
+                                            const bfloat16_t* K,
+                                            const bfloat16_t* V, bfloat16_t* O,
+                                            int br, int kv, int group, void* memory,
+                                            int* Flags) {
+  int block = br;
+  int bad = 0;
+  float minscore = 0;
+  br = br * group + threadIdx.x / 128;
+  int t = threadIdx.x % 128, src = ((t & 63) / 4) * 8 + (t / 64) * 4 + (t & 3);
+  int base = 0;
+  alignas(16) bfloat16_t q[64], k[64], v[64];
+  unsigned p[4];
+  float acc[64] = {0}, s[8], den[4] = {0}, z[4];
+#pragma unroll
+  for (int r = 0; r < 32; ++r) {
+    int row = (r & 1) * 16 + src / 8, col = (r / 2) * 16 + (src & 7) * 2;
+    ((unsigned*)q)[r] =
+        br * 32 + row < kv * 8
+            ? __ldg((const unsigned*)(Q + base + (br * 32 + row) * 256 + col))
+            : 0;
+  }
+  for (int bk = 0; bk < kv / 32; ++bk) {
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      ((uint4*)k)[kp] =
+          __ldg((const uint4*)(K + bk * 8192 + kp * 1024 + t * 8));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = 0;
+    tl::gemm_rr<32, 32, 256, 1, 1, 0, 1, 0, 256, 256, 0, 0>(q, k, s);
+    for (int i = 0; i < 8; ++i) minscore = __musa_fmin_f(minscore, s[i]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      s[i] = __musa_exp2_f(s[i] * 0.09016844005556022f);
+    }
+    row_reduce32(s, z, false);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) den[i] += z[i];
+    cast_scores32(s, p);
+#pragma unroll
+    for (int kc = 0; kc < 2; ++kc) {
+#pragma unroll
+      for (int nc = 0; nc < 4; ++nc)
+        ((uint4*)v)[kc * 4 + nc] = __ldg(
+            (const uint4*)(V + bk * 8192 + kc * 4096 + nc * 1024 + t * 8));
+    }
+    tl::gemm_rr<32, 256, 32, 1, 1, 0, 0, 0, 32, 256, 0, 0>(
+        reinterpret_cast<bfloat16_t*>(p), v, acc);
+  }
+  if (kv % 32) {
+    int bk = kv / 32;
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      ((uint4*)k)[kp] =
+          __ldg((const uint4*)(K + bk * 8192 + kp * 1024 + t * 8));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = 0;
+    tl::gemm_rr<32, 32, 256, 1, 1, 0, 1, 0, 256, 256, 0, 0>(q, k, s);
+    for (int i = 0; i < 8; ++i) {
+      minscore = __musa_fmin_f(minscore, s[i]);
+      int col = (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+      if (bk * 32 + col >= kv) s[i] = -INFINITY;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      s[i] = __musa_exp2_f(s[i] * 0.09016844005556022f);
+    }
+    row_reduce32(s, z, false);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) den[i] += z[i];
+    cast_scores32(s, p);
+#pragma unroll
+    for (int nc = 0; nc < 4; ++nc)
+      ((uint4*)v)[nc] =
+          __ldg((const uint4*)(V + bk * 8192 + nc * 1024 + t * 8));
+    tl::gemm_rr<32, 256, 16, 1, 1, 0, 0, 0, 16, 256, 0, 0>(
+        reinterpret_cast<bfloat16_t*>(p), v, acc);
+  }
+
+  bad = (minscore * 0.09016844005556022f < -120.0f);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    bad |= !(den[i] >= 1.e-26f && den[i] <= 1.e26f);
+    den[i] = __frcp_rn(den[i]);
+  }
+  float check[4] = {0, 0, 0, 0};
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    int row = br * 32 + ((i & 7) / 2) * 8 + (t / 64) * 4 + (t % 32) / 8;
+    int col = (i / 8) * 32 + (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+    bfloat16_t value = bfloat16_t(acc[i] * den[(i & 7) / 2]);
+    check[i & 3] += fabsf(float(value));
+    if (row < kv * 8) O[base + row * 256 + col] = value;
+  }
+  bad |= !isfinite(check[0] + check[1] + check[2] + check[3]);
+  bad = any128(bad);
+  if (t == 0) Flags[br] = bad;
+}
+
+__device__ __forceinline__ void prefix_fallback(const bfloat16_t* Q,
+                                                const bfloat16_t* K,
+                                                const bfloat16_t* V,
+                                                bfloat16_t* O, int block,
+                                                int kv, int group, const int* F) {
+  if (F[block * group + threadIdx.x / 128])
+    prefix_online(Q, K, V, O, block, kv, group, nullptr);
+}
+__device__ __forceinline__ void pack_kv(const bfloat16_t* K,
+                                        const bfloat16_t* V, bfloat16_t* KP,
+                                        bfloat16_t* VP, int kv, int tile,
+                                        int chunk, unsigned* buf) {
+  int t = threadIdx.x, r = t / 8, row = tile * 32 + r,
+      col = chunk * 64 + (t % 8) * 8;
+  uint4 k =
+      row < kv ? __ldg((const uint4*)(K + row * 256 + col)) : uint4{0, 0, 0, 0};
+  uint4 v =
+      row < kv ? __ldg((const uint4*)(V + row * 256 + col)) : uint4{0, 0, 0, 0};
+  int pos = r * 8 + ((t % 8) ^ (r & 0));
+  ((uint4*)buf)[pos] = k;
+  ((uint4*)(buf + 1024))[pos] = v;
+  __syncthreads();
+  uint4 ko, vo;
+  int kt = t % 128, kp = t / 128;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    int kr = kt % 64 / 4 + 16 * (j % 2),
+        kc = kp * 16 + (j / 2) * 8 + kt % 4 + (kt / 64) * 4;
+    ((unsigned*)&ko)[j] = buf[kr * 32 + (kc ^ ((kr & 0) << 2))];
+    int vr = t / 128 * 16 + (t % 128) / 8, vc = j * 8 + t % 8;
+    ((unsigned*)&vo)[j] = buf[1024 + vr * 32 + (vc ^ ((vr & 0) << 2))];
+  }
+  ((uint4*)(KP + tile * 8192 + chunk * 2048))[t] = ko;
+  ((uint4*)(VP + tile * 8192 + (t / 128) * 4096 + chunk * 1024))[(t % 128)] =
+      vo;
+}
+
+// VARIANT_COMPACT_END
+
+// VARIANT_WIDE_BEGIN
+#include <tl_templates/musa/common.h>
+#include <tl_templates/musa/gemm.h>
+__device__ __forceinline__ void row_reduce(const float* src, float* dst,
+                                           bool mx) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float v =
+        mx ? __musa_fmax_f(__musa_fmax_f(src[2 * i], src[2 * i + 1]),
+                           __musa_fmax_f(src[2 * i + 8], src[2 * i + 9]))
+           : src[2 * i] + src[2 * i + 1] + src[2 * i + 8] + src[2 * i + 9];
+#pragma unroll
+    for (int bit = 1; bit <= 32; bit *= 2) {
+      if (bit == 8 || bit == 16) continue;
+      float x =
+          __int_as_float(__musa_shfl_xor_sync_i32(__float_as_int(v), bit, 127));
+      v = mx ? __musa_fmax_f(v, x) : v + x;
+    }
+    dst[i] = v;
+  }
+}
+__device__ __forceinline__ void cast_scores(const float* s, unsigned* p) {
+  int t = threadIdx.x % 128;
+#pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    int i = (r % 2) * 16 + (t % 64) / 4,
+        j = (r / 2) * 16 + (t / 64) * 8 + (t % 4) * 2,
+        base = (r % 2) * 4 + ((r / 2) % 2) + (r / 4) * 8;
+    int source = (i % 8 / 4) * 64 + (j % 16 / 8) * 32 + (i % 4) * 8 + j % 8;
+    unsigned pair = unsigned(bfloat16_t(s[base]).raw()) |
+                    (unsigned(bfloat16_t(s[base + 2]).raw()) << 16);
+    unsigned lo = __musa_shfl_idx_sync_i32(pair, source, 127),
+             hi = __musa_shfl_idx_sync_i32(pair, source + 1, 127);
+    int shift = ((t / 32) % 2) * 16;
+    p[r] = ((lo >> shift) & 65535u) | (((hi >> shift) & 65535u) << 16);
+  }
+}
+__device__ __forceinline__ void row_reduce32(const float* src, float* dst,
+                                             bool mx) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float v = mx ? __musa_fmax_f(src[2 * i], src[2 * i + 1])
+                 : src[2 * i] + src[2 * i + 1];
+#pragma unroll
+    for (int bit = 1; bit <= 32; bit *= 2) {
+      if (bit == 8 || bit == 16) continue;
+      float x =
+          __int_as_float(__musa_shfl_xor_sync_i32(__float_as_int(v), bit, 127));
+      v = mx ? __musa_fmax_f(v, x) : v + x;
+    }
+    dst[i] = v;
+  }
+}
+__device__ __forceinline__ void cast_scores32(const float* s, unsigned* p) {
+  int t = threadIdx.x % 128;
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    int i = (r % 2) * 16 + (t % 64) / 4,
+        j = (r / 2) * 16 + (t / 64) * 8 + (t % 4) * 2,
+        base = (r % 2) * 4 + r / 2;
+    int source = (i % 8 / 4) * 64 + (j % 16 / 8) * 32 + (i % 4) * 8 + j % 8;
+    unsigned pair = unsigned(bfloat16_t(s[base]).raw()) |
+                    (unsigned(bfloat16_t(s[base + 2]).raw()) << 16);
+    unsigned lo = __musa_shfl_idx_sync_i32(pair, source, 127),
+             hi = __musa_shfl_idx_sync_i32(pair, source + 1, 127);
+    int shift = ((t / 32) % 2) * 16;
+    p[r] = ((lo >> shift) & 65535u) | (((hi >> shift) & 65535u) << 16);
+  }
+}
+__device__ __forceinline__ int any128(int value) {
+  int result = __any_sync(0xffffffffu, value);
+  result |= __musa_shfl_xor_sync_i32(result, 32, 127);
+  result |= __musa_shfl_xor_sync_i32(result, 64, 127);
+  result |= __musa_shfl_xor_sync_i32(result, 96, 127);
+  return result;
+}
+__device__ __forceinline__ void prefix_online(const bfloat16_t* Q,
+                                              const bfloat16_t* K,
+                                              const bfloat16_t* V,
+                                              bfloat16_t* O, int br, int kv, int group,
+                                              void* memory) {
+  br = br * group + threadIdx.x / 128;
+  int t = threadIdx.x % 128, src = ((t & 63) / 4) * 8 + (t / 64) * 4 + (t & 3);
+  int base = 0;
+  alignas(16) bfloat16_t q[64], k[64], v[64];
+  unsigned p[4];
+  float acc[64] = {0}, s[8],
+        m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, den[4] = {0}, z[4],
+        next[4], alpha[4];
+#pragma unroll
+  for (int r = 0; r < 32; ++r) {
+    int row = (r & 1) * 16 + src / 8, col = (r / 2) * 16 + (src & 7) * 2;
+    ((unsigned*)q)[r] =
+        br * 32 + row < kv * 8
+            ? __ldg((const unsigned*)(Q + base + (br * 32 + row) * 256 + col))
+            : 0;
+  }
+  for (int bk = 0; bk < (kv + 31) / 32; ++bk) {
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      ((uint4*)k)[kp] =
+          __ldg((const uint4*)(K + bk * 8192 + kp * 1024 + t * 8));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = 0;
+    tl::gemm_rr<32, 32, 256, 1, 1, 0, 1, 0, 256, 256, 0, 0>(q, k, s);
+    for (int i = 0; i < 8; ++i) {
+      int col = (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+      if (bk * 32 + col >= kv) s[i] = -INFINITY;
+    }
+    row_reduce32(s, next, true);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      next[i] = __musa_fmax_f(m[i], next[i]);
+      alpha[i] = __musa_exp2_f((m[i] - next[i]) * 0.09016844005556022f);
+      m[i] = next[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      s[i] = __musa_exp2_f((s[i] - m[i / 2]) * 0.09016844005556022f);
+    row_reduce32(s, z, false);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) den[i] = den[i] * alpha[i] + z[i];
+    cast_scores32(s, p);
+#pragma unroll
+    for (int i = 0; i < 64; ++i) acc[i] *= alpha[(i & 7) / 2];
+#pragma unroll
+    for (int kc = 0; kc < 2; ++kc) {
+#pragma unroll
+      for (int nc = 0; nc < 4; ++nc)
+        ((uint4*)v)[kc * 4 + nc] = __ldg(
+            (const uint4*)(V + bk * 8192 + kc * 4096 + nc * 1024 + t * 8));
+    }
+    tl::gemm_rr<32, 256, 32, 1, 1, 0, 0, 0, 32, 256, 0, 0>(
+        reinterpret_cast<bfloat16_t*>(p), v, acc);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; ++i) den[i] = __frcp_rn(den[i]);
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    int row = br * 32 + ((i & 7) / 2) * 8 + (t / 64) * 4 + (t % 32) / 8;
+    int col = (i / 8) * 32 + (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+    if (row < kv * 8)
+      O[base + row * 256 + col] = bfloat16_t(acc[i] * den[(i & 7) / 2]);
+  }
+}
+
+__device__ __forceinline__ void prefix_fast(const bfloat16_t* Q,
+                                            const bfloat16_t* K,
+                                            const bfloat16_t* V, bfloat16_t* O,
+                                            int br, int kv, int group, void* memory,
+                                            int* Flags) {
+  int block = br;
+  int bad = 0;
+  br = br * group + threadIdx.x / 128;
+  int t = threadIdx.x % 128, src = ((t & 63) / 4) * 8 + (t / 64) * 4 + (t & 3);
+  int base = 0;
+  alignas(16) bfloat16_t q[64], k[64], v[64];
+  unsigned p[4];
+  float acc[64] = {0}, s[8], den[4] = {0}, z[4];
+#pragma unroll
+  for (int r = 0; r < 32; ++r) {
+    int row = (r & 1) * 16 + src / 8, col = (r / 2) * 16 + (src & 7) * 2;
+    ((unsigned*)q)[r] =
+        br * 32 + row < kv * 8
+            ? __ldg((const unsigned*)(Q + base + (br * 32 + row) * 256 + col))
+            : 0;
+  }
+  for (int bk = 0; bk < (kv + 31) / 32; ++bk) {
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      ((uint4*)k)[kp] =
+          __ldg((const uint4*)(K + bk * 8192 + kp * 1024 + t * 8));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = 0;
+    tl::gemm_rr<32, 32, 256, 1, 1, 0, 1, 0, 256, 256, 0, 0>(q, k, s);
+    for (int i = 0; i < 8; ++i) {
+      int col = (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+      if (bk * 32 + col >= kv) s[i] = -INFINITY;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      s[i] = __musa_exp2_f(s[i] * 0.09016844005556022f);
+      int col = (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+      bad |= (bk * 32 + col < kv) && (s[i] < 7.52316384526264e-37f);
+    }
+    row_reduce32(s, z, false);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) den[i] += z[i];
+    cast_scores32(s, p);
+#pragma unroll
+    for (int kc = 0; kc < 2; ++kc) {
+#pragma unroll
+      for (int nc = 0; nc < 4; ++nc)
+        ((uint4*)v)[kc * 4 + nc] = __ldg(
+            (const uint4*)(V + bk * 8192 + kc * 4096 + nc * 1024 + t * 8));
+    }
+    tl::gemm_rr<32, 256, 32, 1, 1, 0, 0, 0, 32, 256, 0, 0>(
+        reinterpret_cast<bfloat16_t*>(p), v, acc);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    bad |= !(den[i] >= 1.e-26f && den[i] <= 1.e26f);
+    den[i] = __frcp_rn(den[i]);
+  }
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    int row = br * 32 + ((i & 7) / 2) * 8 + (t / 64) * 4 + (t % 32) / 8;
+    int col = (i / 8) * 32 + (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+    bfloat16_t value = bfloat16_t(acc[i] * den[(i & 7) / 2]);
+    bad |= !isfinite(acc[i]) || !isfinite(float(value));
+    if (row < kv * 8) O[base + row * 256 + col] = value;
+  }
+  bad = any128(bad);
+  if (t == 0) Flags[br] = bad;
+}
+
+__device__ __forceinline__ void prefix_fallback(const bfloat16_t* Q,
+                                                const bfloat16_t* K,
+                                                const bfloat16_t* V,
+                                                bfloat16_t* O, int block,
+                                                int kv, int group, const int* F) {
+  if (F[block * group + threadIdx.x / 128])
+    prefix_online(Q, K, V, O, block, kv, group, nullptr);
+}
+__device__ __forceinline__ void pack_kv(const bfloat16_t* K,
+                                        const bfloat16_t* V, bfloat16_t* KP,
+                                        bfloat16_t* VP, int kv, int tile,
+                                        unsigned* buf) {
+  int t = threadIdx.x, row = tile * 32 + t / 32, col = (t % 32) * 8;
+  uint4 k =
+      row < kv ? __ldg((const uint4*)(K + row * 256 + col)) : uint4{0, 0, 0, 0};
+  uint4 v =
+      row < kv ? __ldg((const uint4*)(V + row * 256 + col)) : uint4{0, 0, 0, 0};
+  ((uint4*)buf)[t] = k;
+  ((uint4*)(buf + 4096))[t] = v;
+  __syncthreads();
+  uint4 ko, vo;
+  int kt = t % 128, kp = t / 128;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    int kr = kt % 64 / 4 + 16 * (j % 2),
+        pair = kp * 16 + (j / 2) * 8 + kt % 4 + (kt / 64) * 4;
+    ((unsigned*)&ko)[j] = buf[kr * 128 + pair];
+    int vr = t / 512 * 16 + (t % 128) / 8,
+        vp = (t % 512) / 128 * 32 + j * 8 + t % 8;
+    ((unsigned*)&vo)[j] = buf[4096 + vr * 128 + vp];
+  }
+  ((uint4*)(KP + tile * 8192))[t] = ko;
+  ((uint4*)(VP + tile * 8192))[t] = vo;
+}
+
+// VARIANT_WIDE_END

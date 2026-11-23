@@ -86,6 +86,8 @@ pub(crate) struct TilelangBf16Gemm {
     reduce_ready: AtomicBool,
 }
 
+use crate::kernels::attention::tilelang::{TilelangAction, TilelangPrefix, TilelangVision};
+
 include!(concat!(env!("OUT_DIR"), "/tilelang_kernels.rs"));
 
 /// Whether `value` explicitly disables the route (only "off", case
@@ -96,7 +98,7 @@ fn is_off(value: Option<&str>) -> bool {
 
 /// The runtime policy, read once per process like the neighboring workspace
 /// knobs — no allocation or environment lock on the dispatch path.
-fn policy_off() -> bool {
+pub(crate) fn policy_off() -> bool {
     static POLICY: OnceLock<bool> = OnceLock::new();
     *POLICY.get_or_init(|| is_off(std::env::var("APXINF_TILELANG").ok().as_deref()))
 }
@@ -197,7 +199,7 @@ fn bf16_transposed_pack(op: &TilelangBf16Gemm) -> bool {
     op.m == 1
 }
 
-fn initialize(init: InitFn, ready: &AtomicBool) -> Result<()> {
+pub(crate) fn initialize(init: InitFn, ready: &AtomicBool) -> Result<()> {
     if !ready.load(Ordering::Acquire) {
         if unsafe { init() } != 0 {
             return Err(Error::Other("BF16 TileLang init failed".into()));

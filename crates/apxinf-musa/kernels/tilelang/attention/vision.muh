@@ -1,0 +1,114 @@
+#include <tl_templates/musa/common.h>
+#include <tl_templates/musa/gemm.h>
+__device__ __forceinline__ void row_reduce(const float* src, float* dst,
+                                           bool mx) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float v = mx ? __musa_fmax_f(src[2 * i], src[2 * i + 1])
+                 : src[2 * i] + src[2 * i + 1];
+#pragma unroll
+    for (int bit = 1; bit <= 32; bit *= 2) {
+      if (bit == 8 || bit == 16) continue;
+      float x =
+          __int_as_float(__musa_shfl_xor_sync_i32(__float_as_int(v), bit, 127));
+      v = mx ? __musa_fmax_f(v, x) : v + x;
+    }
+    dst[i] = v;
+  }
+}
+__device__ __forceinline__ void cast_scores(const float* s, unsigned* p) {
+  int t = threadIdx.x % 128;
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    int i = (r % 2) * 16 + (t % 64) / 4,
+        j = (r / 2) * 16 + (t / 64) * 8 + (t % 4) * 2,
+        base = (r % 2) * 4 + r / 2;
+    int source = (i % 8 / 4) * 64 + (j % 16 / 8) * 32 + (i % 4) * 8 + j % 8;
+    unsigned pair = unsigned(bfloat16_t(s[base]).raw()) |
+                    (unsigned(bfloat16_t(s[base + 2]).raw()) << 16);
+    unsigned lo = __musa_shfl_idx_sync_i32(pair, source, 127),
+             hi = __musa_shfl_idx_sync_i32(pair, source + 1, 127);
+    int shift = ((t / 32) % 2) * 16;
+    p[r] = ((lo >> shift) & 65535u) | (((hi >> shift) & 65535u) << 16);
+  }
+}
+__device__ __forceinline__ void vision_register(const bfloat16_t* Q,
+                                                const bfloat16_t* K,
+                                                const bfloat16_t* V,
+                                                bfloat16_t* O, int br, int head,
+                                                int batch, void* memory) {
+  br = br * 4 + threadIdx.x / 128;
+  bfloat16_t* ks = (bfloat16_t*)memory;
+  bfloat16_t* vs = ks + 2560;
+  int t = threadIdx.x % 128, src = ((t & 63) / 4) * 8 + (t / 64) * 4 + (t & 3);
+  int base = batch * 256 * 16 * 72 + head * 72;
+  bfloat16_t q[20], k[20], v[24];
+  unsigned p[4];
+  float acc[24] = {0}, s[8],
+        m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, den[4] = {0}, z[4],
+        next[4], alpha[4];
+#pragma unroll
+  for (int r = 0; r < 10; ++r) {
+    int row = (r & 1) * 16 + src / 8, col = (r / 2) * 16 + (src & 7) * 2;
+    ((unsigned*)q)[r] =
+        col < 72 ? *(const unsigned*)(Q + base + (br * 32 + row) * 1152 + col)
+                 : 0;
+  }
+  for (int bk = 0; bk < 8; ++bk) {
+#pragma unroll
+    for (int x = threadIdx.x; x < 384; x += 512) {
+      int row = x / 12, col = (x % 12) * 8;
+      if (col < 72) {
+        *(uint4*)(ks + row * 80 + col) =
+            *(const uint4*)(K + base + (bk * 32 + row) * 1152 + col);
+        *(uint4*)(vs + row * 96 + col) =
+            *(const uint4*)(V + base + (bk * 32 + row) * 1152 + col);
+      } else {
+        if (col < 80) *(uint4*)(ks + row * 80 + col) = uint4{0, 0, 0, 0};
+        *(uint4*)(vs + row * 96 + col) = uint4{0, 0, 0, 0};
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < 10; ++r) {
+      int row = (r & 1) * 16 + src / 8, col = (r / 2) * 16 + (src & 7) * 2;
+      ((unsigned*)k)[r] = *(const unsigned*)(ks + row * 80 + col);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] = 0;
+    tl::gemm_rr<32, 32, 80, 1, 1, 0, 1, 0, 80, 80, 0, 0>(q, k, s);
+    row_reduce(s, next, true);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      next[i] = __musa_fmax_f(m[i], next[i]);
+      alpha[i] = __musa_exp2_f((m[i] - next[i]) * 0.170023241099464f);
+      m[i] = next[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      s[i] = __musa_exp2_f((s[i] - m[i / 2]) * 0.170023241099464f);
+    row_reduce(s, z, false);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) den[i] = den[i] * alpha[i] + z[i];
+    cast_scores(s, p);
+#pragma unroll
+    for (int i = 0; i < 24; ++i) acc[i] *= alpha[(i & 7) / 2];
+#pragma unroll
+    for (int r = 0; r < 12; ++r) {
+      int row = (r / 6) * 16 + t / 8, col = (r % 6) * 16 + (t & 7) * 2;
+      ((unsigned*)v)[r] = *(const unsigned*)(vs + row * 96 + col);
+    }
+    tl::gemm_rr<32, 96, 32, 1, 1, 0, 0, 0, 32, 96, 0, 0>(
+        reinterpret_cast<bfloat16_t*>(p), v, acc);
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) den[i] = __frcp_rn(den[i]);
+#pragma unroll
+  for (int i = 0; i < 24; ++i) {
+    int row = br * 32 + ((i & 7) / 2) * 8 + (t / 64) * 4 + (t % 32) / 8;
+    int col = (i / 8) * 32 + (i % 2) * 16 + ((t % 64) / 32) * 8 + t % 8;
+    if (col < 72)
+      O[base + row * 1152 + col] = bfloat16_t(acc[i] * den[(i & 7) / 2]);
+  }
+}
